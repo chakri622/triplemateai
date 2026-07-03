@@ -27,6 +27,7 @@ from tools.tavily_tool import web_search, tavily_search
 load_dotenv()
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+DEFAULT_ORIGIN_IATA = os.getenv("DEFAULT_ORIGIN_IATA")
 
 def get_database_url() -> str:
     """Get the database URL from the environment variable.
@@ -72,15 +73,31 @@ class TravelState(TypedDict):
 
 class Route(BaseModel):
     """Origin and destination extracted from a travel query."""
-    origin: str = Field(description="Origin city, country, or airport code the traveler departs from.")
-    destination: str = Field(description="Destination city, country, or airport code the traveler is going to.")
+    origin: str | None = Field(
+        default=None,
+        description="Departure city, country, or airport code the traveler EXPLICITLY states. Null if not stated.",
+    )
+    destination: str | None = Field(
+        default=None,
+        description="Destination city, country, or airport code the traveler EXPLICITLY states. Null if not stated.",
+    )
 
 
 def _extract_route(user_query: str) -> Route:
-    """Use the LLM to pull origin and destination out of a free-text query."""
+    """Use the LLM to pull origin and destination out of a free-text query.
+
+    Only returns locations the user actually mentions; missing locations come
+    back as None instead of a hallucinated guess.
+    """
     extractor = llm.with_structured_output(Route)
     return extractor.invoke([
-        SystemMessage(content="Extract the origin and destination locations from the user's travel query. Return plain place names or IATA codes."),
+        SystemMessage(content=(
+            "You extract travel routes. Read the user's message and return ONLY the "
+            "departure (origin) and destination locations they explicitly mention. "
+            "If the origin or destination is missing, vague, or not a real place, return "
+            "null for that field. Never invent, guess, or assume a location that the user "
+            "did not clearly state."
+        )),
         HumanMessage(content=user_query),
     ])
 
@@ -93,12 +110,42 @@ def flight_agent(state: TravelState) -> TravelState:
     """Flight agent that looks up flights and distances."""
     user_query = state["user_query"]
     route = _extract_route(user_query)
-    flight_results = search_flights(route.origin, route.destination, limit=5)
+
+    # Validate that each extracted location resolves to a real airport. This
+    # guards against the LLM hallucinating a place from a vague/off-topic query.
+    origin_iata = resolve_location_to_iata(route.origin) if route.origin else None
+    dest_iata = resolve_location_to_iata(route.destination) if route.destination else None
+
+    # Fall back to the configured home airport when no origin was given.
+    if not origin_iata and DEFAULT_ORIGIN_IATA:
+        origin_iata = resolve_location_to_iata(DEFAULT_ORIGIN_IATA)
+
+    # If we still can't pin down the route, ask instead of guessing.
+    if not origin_iata or not dest_iata:
+        missing = []
+        if not origin_iata:
+            missing.append("a departure city")
+        if not dest_iata:
+            missing.append("a destination city")
+        note = (
+            "I couldn't identify " + " and ".join(missing) + " from your request. "
+            "Please tell me where you're flying from and where you'd like to go "
+            "(e.g. 'from Austin to Tokyo')."
+        )
+        return {
+            "origin": route.origin or "",
+            "destination": route.destination or "",
+            "flight_results": note,
+            "messages": [AIMessage(content=note)],
+            "llm_calls": state.get("llm_calls", 0) + 1,
+        }
+
+    flight_results = search_flights(origin_iata, dest_iata, limit=5)
     return {
-        "origin": route.origin,
-        "destination": route.destination,
+        "origin": route.origin or origin_iata,
+        "destination": route.destination or dest_iata,
         "flight_results": flight_results,
-        "messages": [AIMessage(content=f"Flight results found for {route.origin} -> {route.destination}.")],
+        "messages": [AIMessage(content=f"Flight results found for {origin_iata} -> {dest_iata}.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
